@@ -63,12 +63,24 @@ Spawn ALL configured reviewers IN PARALLEL using the Agent tool. For each review
 
 #### 3b. COLLECT
 
-Gather all reviewer feedback. Parse each reviewer's response for:
+Gather all reviewer feedback. For each reviewer, record:
 - BLOCKING issues (must fix before proceeding)
 - NIT issues (non-blocking suggestions)
 - Overall verdict: PASS or NEEDS_CHANGES
 - If a reviewer's output has no clear verdict, treat it as NEEDS_CHANGES
-- If the Agent tool errors for a reviewer, treat that reviewer as PASS and note it as "unavailable"
+- If the Agent tool errors for a reviewer, mark that reviewer as UNAVAILABLE (not PASS)
+
+**Fallback: if ALL reviewers are UNAVAILABLE**
+
+If every configured reviewer returned an Agent tool error (i.e., all are marked UNAVAILABLE), do not treat the round as all-PASS. Instead:
+
+1. Note in the report that custom review agents are not installed.
+2. Run the built-in `/review` command to perform a standard review of the changes.
+3. Parse the `/review` output for BLOCKING issues and NITs using the same criteria (BLOCKING = must fix, NIT = suggestion).
+4. Use the `/review` output as the sole reviewer result for this round, labelled as "built-in /review (fallback)".
+5. Continue to Phase 3c (FIX-VERIFY LOOP) normally with the fallback verdict.
+
+If only SOME reviewers are UNAVAILABLE (but at least one ran successfully), treat the unavailable ones as PASS and continue with the results from those that did run.
 
 #### 3c. FIX-VERIFY LOOP
 
@@ -113,7 +125,8 @@ After all rounds complete, present a final summary to the user:
 
 - **No changes detected**: Stop early, report to user
 - **Reviewer output has no clear verdict**: Treat as NEEDS_CHANGES
-- **Agent tool error**: Treat that reviewer as PASS, note "unavailable" in report
+- **Agent tool error (some reviewers)**: Treat unavailable reviewers as PASS, note "unavailable" in report
+- **Agent tool error (ALL reviewers)**: Do not treat as PASS. Fall back to the built-in `/review` command as the sole reviewer for this round
 - **Fix-verify loop hits max iterations (3)**: Report remaining issues, proceed to next round
 - **After final round**: Report any unresolved BLOCKING issues clearly to user
 
@@ -123,3 +136,4 @@ After all rounds complete, present a final summary to the user:
 - Reviewers have full repo access (Read, Grep, Glob) and should explore beyond just the diff.
 - Each round uses completely fresh agent instances with no prior context.
 - The outer loop (rounds) always runs all configured rounds. The inner loop (fix-verify) ensures fixes are correct before moving on.
+- If custom reviewer agents are not installed, the skill automatically falls back to the built-in `/review` command. To get full multi-perspective review, copy the agent files from the repo's `agents/` directory to `~/.claude/agents/`.
