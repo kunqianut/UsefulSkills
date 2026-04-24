@@ -67,7 +67,7 @@ Gather all reviewer feedback. For each reviewer, record:
 - BLOCKING issues (must fix before proceeding)
 - NIT issues (non-blocking suggestions)
 - Overall verdict: PASS or NEEDS_CHANGES
-- If a reviewer's output has no clear verdict, treat it as NEEDS_CHANGES
+- If a reviewer's output has no clear verdict, treat it as NEEDS_CHANGES and mark it as "AMBIGUOUS" in the per-round report row. Include the first 200 characters of the reviewer's raw output so the user can diagnose whether the reviewer agent is broken.
 - If the Agent tool errors for a reviewer, mark that reviewer as UNAVAILABLE (not PASS)
 
 **Fallback: if ALL reviewers are UNAVAILABLE**
@@ -80,7 +80,7 @@ If every configured reviewer returned an Agent tool error (i.e., all are marked 
 4. Use the `/review` output as the sole reviewer result for this round, labelled as "built-in /review (fallback)".
 5. Continue to Phase 3c (FIX-VERIFY LOOP) normally with the fallback verdict.
 
-If only SOME reviewers are UNAVAILABLE (but at least one ran successfully), treat the unavailable ones as PASS and continue with the results from those that did run.
+If only SOME reviewers are UNAVAILABLE (but at least one ran successfully), treat the unavailable ones as ABSENT — they are neither PASS nor NEEDS_CHANGES and must not count toward the verdict. In the per-round report row, mark them as "UNAVAILABLE" (not PASS). Continue with the results from those that did run, and note in the report header how many of N reviewers actually ran.
 
 #### 3c. FIX-VERIFY LOOP
 
@@ -124,8 +124,8 @@ After all rounds complete, present a final summary to the user:
 ## Error Handling
 
 - **No changes detected**: Stop early, report to user
-- **Reviewer output has no clear verdict**: Treat as NEEDS_CHANGES
-- **Agent tool error (some reviewers)**: Treat unavailable reviewers as PASS, note "unavailable" in report
+- **Reviewer output has no clear verdict**: Treat as NEEDS_CHANGES, mark as AMBIGUOUS in report with first 200 chars of raw output
+- **Agent tool error (some reviewers)**: Treat unavailable reviewers as ABSENT (not PASS), mark as UNAVAILABLE in report, reduce the reviewer count denominator for that round
 - **Agent tool error (ALL reviewers)**: Do not treat as PASS. Fall back to the built-in `/review` command as the sole reviewer for this round
 - **Fix-verify loop hits max iterations (3)**: Report remaining issues, proceed to next round
 - **After final round**: Report any unresolved BLOCKING issues clearly to user
