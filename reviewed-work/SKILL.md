@@ -1,6 +1,6 @@
 ---
 name: reviewed-work
-argument-hint: "[--rounds N] [task description]"
+argument-hint: "[--light] [--rounds N] [task description]"
 disable-model-invocation: true
 ---
 
@@ -19,13 +19,27 @@ You may customize the default REVIEWERS list by editing the values above.
 ## Argument Parsing
 
 Parse `$ARGUMENTS` as follows:
-- If arguments start with `--rounds N`, extract N as the number of review rounds and treat the rest as the task description.
+- If arguments contain `--light`, enable light mode (see below) and remove the flag from the remaining arguments.
+- If arguments contain `--rounds N`, extract N as the number of review rounds and treat the rest as the task description.
 - Otherwise, use the default REVIEW_ROUNDS and treat all arguments as the task description.
+- `--light` and `--rounds` can be combined, but `--light` overrides REVIEWERS to use only the built-in `/review`.
 
 Examples:
-- `/reviewed-work implement auth` -> rounds=2, task="implement auth"
-- `/reviewed-work --rounds 3 implement auth` -> rounds=3, task="implement auth"
-- `/reviewed-work --rounds 1 fix the login bug` -> rounds=1, task="fix the login bug"
+- `/reviewed-work implement auth` -> rounds=2, full review, task="implement auth"
+- `/reviewed-work --rounds 3 implement auth` -> rounds=3, full review, task="implement auth"
+- `/reviewed-work --rounds 1 fix the login bug` -> rounds=1, full review, task="fix the login bug"
+- `/reviewed-work --light implement auth` -> rounds=1, light review, task="implement auth"
+- `/reviewed-work --light --rounds 2 implement auth` -> rounds=2, light review, task="implement auth"
+
+### Light Mode
+
+When `--light` is set:
+- **REVIEW_ROUNDS** defaults to 1 (unless explicitly overridden with `--rounds N`)
+- **Skip Phase 3a entirely** — do not spawn any subagent reviewers
+- **Instead**, run the built-in `/review` command directly on the changes
+- Parse the `/review` output for BLOCKING issues and NITs
+- Continue to Phase 3c (FIX-VERIFY LOOP) normally — if `/review` found BLOCKING issues, fix them and re-run `/review` to verify (cap at 3 iterations)
+- The Phase 4 report uses a simplified format showing only the `/review` results
 
 ## Workflow
 
