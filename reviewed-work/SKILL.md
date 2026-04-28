@@ -38,8 +38,21 @@ When `--light` is set:
 - **Skip Phase 3a entirely** — do not spawn any subagent reviewers
 - **Instead**, run the built-in `/review` command directly on the changes
 - Parse the `/review` output for BLOCKING issues and NITs
-- Continue to Phase 3c (FIX-VERIFY LOOP) normally — if `/review` found BLOCKING issues, fix them and re-run `/review` to verify (cap at 3 iterations)
-- The Phase 4 report uses a simplified format showing only the `/review` results
+- Continue to Phase 3c (FIX-VERIFY LOOP) — if `/review` found BLOCKING issues, fix them and re-run `/review` (not subagent reviewers) to verify (cap at 3 iterations)
+- The Phase 4 report uses the following simplified format:
+
+```
+## Review Summary (Light Mode)
+
+### Round 1
+- built-in /review: PASS/NEEDS_CHANGES (N fix-verify iterations)
+
+### Totals
+- Rounds: N
+- Fix-verify iterations: N total
+- Remaining NITs: (list any non-blocking suggestions)
+- Unresolved BLOCKING issues: (list any, if max iterations were hit)
+```
 
 ## Workflow
 
