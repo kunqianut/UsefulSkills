@@ -61,7 +61,9 @@ SHORT_ID="${SESSION_ID:0:8}"
 PROJECT_NAME=$(basename "$CWD")
 
 EXISTING=$(find "${VAULT}/sessions/raw/${PROJECT_NAME}" -name "*-${SHORT_ID}.md" 2>/dev/null | head -1)
-[ -n "$EXISTING" ] && exit 0
+if [ -n "$EXISTING" ] && [ ! "$JSONL_PATH" -nt "$EXISTING" ]; then
+    exit 0
+fi
 
 export _CAPTURE_JSONL_PATH="$JSONL_PATH"
 export _CAPTURE_VAULT="$VAULT"
