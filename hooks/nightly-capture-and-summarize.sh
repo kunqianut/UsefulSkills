@@ -1,72 +1,100 @@
 #!/bin/bash
-# SessionEnd hook: auto-capture the current session's raw conversation data
-# to the Obsidian vault when a Claude Code session closes.
+# Nightly cron script: capture and summarize active Claude Code sessions.
+# Scans all project directories for JSONL files modified in the last 24 hours,
+# captures any that are new or have new content, then summarizes via claude -p.
 #
 # Install:
-#   cp hooks/auto-capture-session.sh ~/.claude/hooks/
-#   chmod +x ~/.claude/hooks/auto-capture-session.sh
-#   Add to ~/.claude/settings.json:
-#   {
-#     "hooks": {
-#       "SessionEnd": [{
-#         "matcher": "",
-#         "hooks": [{
-#           "type": "command",
-#           "command": "bash ~/.claude/hooks/auto-capture-session.sh"
-#         }]
-#       }]
-#     }
-#   }
+#   cp hooks/nightly-capture-and-summarize.sh ~/.claude/hooks/
+#   chmod +x ~/.claude/hooks/nightly-capture-and-summarize.sh
+#   crontab -e  # add the following line:
+#   0 3 * * * bash ~/.claude/hooks/nightly-capture-and-summarize.sh >> ~/ObsidianVaults/ClaudeCode/_logs/nightly-cron.log 2>&1
 
 VAULT="${CLAUDE_VAULT_PATH:-$HOME/ObsidianVaults/ClaudeCode}"
+PROJECTS_DIR="$HOME/.claude/projects"
+LOG_DIR="${VAULT}/_logs"
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+mkdir -p "$LOG_DIR" || { echo "Error: could not create log dir $LOG_DIR" >&2; exit 1; }
+
+echo "========================================="
+echo "Nightly capture started: $TIMESTAMP"
+echo "========================================="
 
 if ! command -v python3 &>/dev/null; then
-    echo "Auto-capture skipped: python3 not found." >&2
+    echo "Error: python3 not found." >&2
+    exit 1
+fi
+
+if [ ! -d "$PROJECTS_DIR" ]; then
+    echo "No projects directory found at $PROJECTS_DIR"
     exit 0
 fi
 
-INPUT=$(cat)
+CAPTURED_COUNT=0
+SUMMARIZED_COUNT=0
+SKIPPED_COUNT=0
+FAILED_COUNT=0
 
-# Parse session_id and cwd in a single Python call to avoid double-parsing
-eval "$(echo "$INPUT" | python3 -c "
-import json, sys, shlex
-d = json.load(sys.stdin)
-sid = d.get('session_id', '')
-cwd = d.get('cwd', '')
-print(f'SESSION_ID={shlex.quote(sid)}')
-print(f'CWD={shlex.quote(cwd)}')
-" 2>/dev/null)"
+for proj_dir in "$PROJECTS_DIR"/*/; do
+    [ ! -d "$proj_dir" ] && continue
 
-if [ -z "$SESSION_ID" ]; then
-    echo "Auto-capture: session_id not present in hook input, skipping." >&2
-    exit 0
-fi
-if [ -z "$CWD" ]; then
-    echo "Auto-capture: no cwd in hook input, skipping." >&2
-    exit 0
-fi
+    proj_encoded=$(basename "$proj_dir")
 
-ENCODED=$(echo "$CWD" | sed 's|/|-|g')
-PROJ_DIR="$HOME/.claude/projects/${ENCODED}"
+    while IFS= read -r jsonl_file; do
+        [ -z "$jsonl_file" ] && continue
 
-if [ ! -d "$PROJ_DIR" ]; then
-    echo "Auto-capture: project directory not found: $PROJ_DIR" >&2
-    exit 0
-fi
+        session_id=$(basename "$jsonl_file" .jsonl)
+        short_id="${session_id:0:8}"
 
-JSONL_PATH="${PROJ_DIR}/${SESSION_ID}.jsonl"
-[ ! -f "$JSONL_PATH" ] && exit 0
+        # Skip files held open by a running Claude process (active sessions)
+        if lsof "$jsonl_file" 2>/dev/null | grep -qi "claude"; then
+            echo "  Skipping active session: $short_id"
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
 
-SHORT_ID="${SESSION_ID:0:8}"
-PROJECT_NAME=$(basename "$CWD")
+        # Decode project name from the first record's cwd
+        export _PROBE_JSONL="$jsonl_file"
+        project_name=$(python3 -c "
+import json, os
+fpath = os.environ['_PROBE_JSONL']
+with open(fpath) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            r = json.loads(line)
+            if r.get('cwd'):
+                print(os.path.basename(r['cwd']))
+                break
+        except json.JSONDecodeError: pass
+" 2>/dev/null)
+        unset _PROBE_JSONL
 
-EXISTING=$(find "${VAULT}/sessions/raw/${PROJECT_NAME}" -name "*-${SHORT_ID}.md" 2>/dev/null | head -1)
-[ -n "$EXISTING" ] && exit 0
+        [ -z "$project_name" ] && project_name="unknown"
 
-export _CAPTURE_JSONL_PATH="$JSONL_PATH"
-export _CAPTURE_VAULT="$VAULT"
+        raw_dir="${VAULT}/sessions/raw/${project_name}"
+        existing=$(find "$raw_dir" -name "*-${short_id}.md" 2>/dev/null | head -1)
 
-RESULT=$(python3 << 'PYEOF'
+        needs_capture=false
+        if [ -z "$existing" ]; then
+            needs_capture=true
+        elif [ "$jsonl_file" -nt "$existing" ]; then
+            needs_capture=true
+        fi
+
+        if [ "$needs_capture" = false ]; then
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
+
+        echo ""
+        echo "Capturing: $project_name ($short_id...)"
+
+        export _CAPTURE_JSONL_PATH="$jsonl_file"
+        export _CAPTURE_VAULT="$VAULT"
+
+        CAPTURE_RESULT=$(python3 << 'PYEOF'
 import json, os, sys
 from collections import Counter
 from datetime import datetime
@@ -94,7 +122,7 @@ if skipped > 0:
     sys.stderr.write(f"Warning: {skipped} malformed lines skipped in {fpath}\n")
 
 if not records:
-    sys.stderr.write(f"Error: no valid records found in {fpath} ({skipped} lines were malformed)\n")
+    sys.stderr.write(f"No valid records in {fpath}\n")
     sys.exit(1)
 
 session_id = ""
@@ -140,15 +168,17 @@ if timestamps:
         start_time, end_time = timestamps[0], timestamps[-1]
 else:
     start_time, end_time = "", ""
+
 date = start_time[:10] if start_time else datetime.now().strftime("%Y-%m-%d")
 title = custom_title or agent_name or "Untitled"
 
 duration_minutes = 0
 if start_time and end_time:
     try:
-        t1 = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        t2 = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        duration_minutes = int((t2 - t1).total_seconds() / 60)
+        t1 = parse_ts(start_time)
+        t2 = parse_ts(end_time)
+        if t1 and t2:
+            duration_minutes = int((t2 - t1).total_seconds() / 60)
     except (ValueError, TypeError) as e:
         sys.stderr.write(f"Warning: could not parse timestamps for duration: {e}\n")
         duration_minutes = 0
@@ -263,7 +293,7 @@ try:
     with open(out_path, "w") as f:
         f.write(output)
 except OSError as e:
-    sys.stderr.write(f"Error: could not write session capture to {out_dir}: {e}\n")
+    sys.stderr.write(f"Error writing to {out_dir}: {e}\n")
     sys.exit(2)
 
 print(json.dumps({
@@ -271,20 +301,51 @@ print(json.dumps({
     "project": project_name,
     "branch": primary_branch,
     "date": date,
-    "duration": duration_minutes,
-    "turns": turn_num
+    "turns": turn_num,
+    "session_id": session_id
 }))
 PYEOF
 )
-PYTHON_EXIT=$?
 
-unset _CAPTURE_JSONL_PATH _CAPTURE_VAULT
+        PYTHON_EXIT=$?
+        unset _CAPTURE_JSONL_PATH _CAPTURE_VAULT
 
-if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
-    PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))")
-    BRANCH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('branch',''))")
-    DATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('date',''))")
-    echo "Session captured on exit: ${PROJECT}/${BRANCH} (${DATE})."
-else
-    echo "Auto-capture failed for current session. Run /capture-session manually to retry." >&2
-fi
+        if [ $PYTHON_EXIT -ne 0 ] || [ -z "$CAPTURE_RESULT" ]; then
+            echo "  FAILED: capture error for $short_id ($jsonl_file)"
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+            continue
+        fi
+
+        CAPTURED_COUNT=$((CAPTURED_COUNT + 1))
+        CAP_PROJECT=$(echo "$CAPTURE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))" 2>/dev/null)
+        CAP_PATH=$(echo "$CAPTURE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path',''))" 2>/dev/null)
+        echo "  Captured: $CAP_PATH"
+
+        # Summarize via headless claude
+        if command -v claude &>/dev/null; then
+            echo "  Summarizing via claude -p..."
+            SUMMARIZE_PROMPT=$(printf 'Run /summarize-session for the session file at the path %s in project %s. Read the raw session file and generate a structured summary.' "$CAP_PATH" "$CAP_PROJECT")
+            SUMMARIZE_OUTPUT=$(claude -p "$SUMMARIZE_PROMPT" 2>&1)
+            CLAUDE_EXIT=$?
+
+            if [ $CLAUDE_EXIT -eq 0 ]; then
+                SUMMARIZED_COUNT=$((SUMMARIZED_COUNT + 1))
+                echo "  Summarized successfully"
+            else
+                echo "  Summarization failed (exit $CLAUDE_EXIT): $(echo "$SUMMARIZE_OUTPUT" | head -3)"
+            fi
+        else
+            echo "  Skipping summarization: claude CLI not found. Run /summarize-session manually."
+        fi
+
+    done < <(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -mtime -2 2>/dev/null)
+done
+
+echo ""
+echo "========================================="
+echo "Nightly capture complete: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "  Captured:   $CAPTURED_COUNT"
+echo "  Summarized: $SUMMARIZED_COUNT"
+echo "  Skipped:    $SKIPPED_COUNT (already up to date)"
+echo "  Failed:     $FAILED_COUNT"
+echo "========================================="
