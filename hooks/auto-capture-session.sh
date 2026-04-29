@@ -57,6 +57,27 @@ fi
 JSONL_PATH="${PROJ_DIR}/${SESSION_ID}.jsonl"
 [ ! -f "$JSONL_PATH" ] && exit 0
 
+# Skip programmatic sessions (sdk-cli = background claude -p, hooks, SDK calls)
+export _PROBE_PATH="$JSONL_PATH"
+ENTRYPOINT=$(python3 -c "
+import json, os
+with open(os.environ['_PROBE_PATH']) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            r = json.loads(line)
+            if r.get('entrypoint'):
+                print(r['entrypoint'])
+                break
+        except json.JSONDecodeError: pass
+" 2>/dev/null)
+unset _PROBE_PATH
+
+if [ "$ENTRYPOINT" != "cli" ]; then
+    exit 0
+fi
+
 SHORT_ID="${SESSION_ID:0:8}"
 PROJECT_NAME=$(basename "$CWD")
 
