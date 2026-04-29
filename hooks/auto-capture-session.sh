@@ -287,13 +287,19 @@ if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
     CAP_PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))" 2>/dev/null)
     CAP_BRANCH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('branch',''))" 2>/dev/null)
     CAP_DATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('date',''))" 2>/dev/null)
-    echo "Session captured on exit: ${CAP_PROJECT}/${CAP_BRANCH} (${CAP_DATE})."
+    CAP_TURNS=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('turns',0))" 2>/dev/null)
+    echo "Session captured on exit: ${CAP_PROJECT}/${CAP_BRANCH} (${CAP_DATE}, ${CAP_TURNS} turns)."
 
-    # Summarize in background via headless claude
-    if command -v claude &>/dev/null && [ -n "$CAP_PATH" ]; then
+    # Summarize in background via headless claude (skip short sessions)
+    MIN_TURNS=2
+    if command -v claude &>/dev/null && [ -n "$CAP_PATH" ] && [ "${CAP_TURNS:-0}" -ge "$MIN_TURNS" ]; then
         SUMMARY_DIR="${VAULT}/sessions/summaries/${CAP_PROJECT}"
-        THREAD_DIR="${VAULT}/threads/${CAP_PROJECT}"
         SUMMARY_FILE="${SUMMARY_DIR}/$(basename "$CAP_PATH")"
+
+        # Skip if summary already exists and is newer than the capture
+        if [ -f "$SUMMARY_FILE" ] && [ ! "$CAP_PATH" -nt "$SUMMARY_FILE" ]; then
+            echo "Summary already up to date, skipping."
+        else
 
         SUMMARIZE_PROMPT=$(cat << PROMPTEOF
 Read the raw Claude Code session file at ${CAP_PATH}.
@@ -312,11 +318,13 @@ Write the summary to ${SUMMARY_FILE} with this YAML frontmatter: date, project, 
 
 The body should have sections: What Happened, User Intent, Key Decisions, Action Items (checkboxes), Open Questions, Files Touched, Topics.
 
-Create directories with mkdir -p if needed: ${SUMMARY_DIR} and ${THREAD_DIR}.
+Create directories with mkdir -p if needed: ${SUMMARY_DIR}.
 PROMPTEOF
 )
         nohup claude -p "$SUMMARIZE_PROMPT" > "${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
         echo "Summarization started in background (pid $!)."
+
+        fi  # end summary freshness check
     fi
 else
     echo "Auto-capture failed for current session. Run /capture-session manually to retry." >&2
