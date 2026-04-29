@@ -291,7 +291,30 @@ if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
 
     # Summarize in background via headless claude
     if command -v claude &>/dev/null && [ -n "$CAP_PATH" ]; then
-        SUMMARIZE_PROMPT=$(printf 'Run /summarize-session for the session file at the path %s in project %s. Read the raw session file and generate a structured summary.' "$CAP_PATH" "$CAP_PROJECT")
+        SUMMARY_DIR="${VAULT}/sessions/summaries/${CAP_PROJECT}"
+        THREAD_DIR="${VAULT}/threads/${CAP_PROJECT}"
+        SUMMARY_FILE="${SUMMARY_DIR}/$(basename "$CAP_PATH")"
+
+        SUMMARIZE_PROMPT=$(cat << PROMPTEOF
+Read the raw Claude Code session file at ${CAP_PATH}.
+
+Then analyze it and produce a structured summary as a markdown file. Extract:
+- A 2-3 sentence summary of what was accomplished
+- Key decisions made (with rationale)
+- Action items (open/done)
+- Open questions
+- Files touched
+- 2-5 topic tags
+- Status (completed/in-progress/blocked)
+- User intent
+
+Write the summary to ${SUMMARY_FILE} with this YAML frontmatter: date, project, session_id, branch, type: session-summary, tags, status, last_summarized_at (current ISO timestamp), summarized_through (latest turn timestamp), decisions, action_items, open_questions, files_touched, raw_session (wikilink to raw file).
+
+The body should have sections: What Happened, User Intent, Key Decisions, Action Items (checkboxes), Open Questions, Files Touched, Topics.
+
+Create directories with mkdir -p if needed: ${SUMMARY_DIR} and ${THREAD_DIR}.
+PROMPTEOF
+)
         nohup claude -p "$SUMMARIZE_PROMPT" > "${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
         echo "Summarization started in background (pid $!)."
     fi
