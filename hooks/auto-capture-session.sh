@@ -283,10 +283,18 @@ PYTHON_EXIT=$?
 unset _CAPTURE_JSONL_PATH _CAPTURE_VAULT
 
 if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
-    PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))")
-    BRANCH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('branch',''))")
-    DATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('date',''))")
-    echo "Session captured on exit: ${PROJECT}/${BRANCH} (${DATE})."
+    CAP_PATH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path',''))" 2>/dev/null)
+    CAP_PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))" 2>/dev/null)
+    CAP_BRANCH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('branch',''))" 2>/dev/null)
+    CAP_DATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('date',''))" 2>/dev/null)
+    echo "Session captured on exit: ${CAP_PROJECT}/${CAP_BRANCH} (${CAP_DATE})."
+
+    # Summarize in background via headless claude
+    if command -v claude &>/dev/null && [ -n "$CAP_PATH" ]; then
+        SUMMARIZE_PROMPT=$(printf 'Run /summarize-session for the session file at the path %s in project %s. Read the raw session file and generate a structured summary.' "$CAP_PATH" "$CAP_PROJECT")
+        nohup claude -p "$SUMMARIZE_PROMPT" > "${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
+        echo "Summarization started in background (pid $!)."
+    fi
 else
     echo "Auto-capture failed for current session. Run /capture-session manually to retry." >&2
 fi
