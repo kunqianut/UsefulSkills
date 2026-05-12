@@ -18,7 +18,26 @@
 #     }
 #   }
 
+[ "$CLAUDE_NO_CAPTURE" = "1" ] && exit 0
+
 VAULT="${CLAUDE_VAULT_PATH:-$HOME/ObsidianVaults/ClaudeCode}"
+
+# Kill any summarizer processes running longer than 10 minutes (likely zombies)
+while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    ELAPSED=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$ELAPSED" in
+        *-*|*:*:*) # days or hours — definitely stale
+            echo "Killing stale summarizer (pid $pid, elapsed $ELAPSED)" >&2
+            kill "$pid" 2>/dev/null
+            ;;
+    esac
+done < <(pgrep -f "claude -p.*session-summary" 2>/dev/null; pgrep -f "claude -p.*summarize-session" 2>/dev/null)
+
+# Rotate old summarize logs (keep last 30)
+if [ -d "${VAULT}/_logs" ]; then
+    find "${VAULT}/_logs" -name "summarize-*.log" -mtime +7 -delete 2>/dev/null
+fi
 
 if ! command -v python3 &>/dev/null; then
     echo "Auto-capture skipped: python3 not found." >&2
@@ -313,6 +332,12 @@ if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
 
     # Summarize in background via headless claude (skip short sessions)
     MIN_TURNS=2
+    SUMMARIZE_TIMEOUT=300  # 5 minutes max
+    SUMMARIZE_MAX_PROCS=2  # max concurrent summarizers
+    LOCK_DIR="${VAULT}/_locks"
+    QUEUE_DIR="${VAULT}/_queue"
+    QUEUE_FILE="${QUEUE_DIR}/pending-summaries.txt"
+
     if command -v claude &>/dev/null && [ -n "$CAP_PATH" ] && [ "${CAP_TURNS:-0}" -ge "$MIN_TURNS" ]; then
         SUMMARY_DIR="${VAULT}/sessions/summaries/${CAP_PROJECT}"
         SUMMARY_FILE="${SUMMARY_DIR}/$(basename "$CAP_PATH")"
@@ -322,7 +347,39 @@ if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
             echo "Summary already up to date, skipping."
         else
 
-        SUMMARIZE_PROMPT=$(cat << PROMPTEOF
+        # Helper: enqueue a session for retry at next SessionStart
+        _enqueue_retry() {
+            mkdir -p "$QUEUE_DIR" 2>/dev/null
+            # Avoid duplicates
+            if ! grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null; then
+                echo "$CAP_PATH" >> "$QUEUE_FILE"
+            fi
+        }
+
+        # Guard: don't spawn if too many summarizers are already running
+        RUNNING=$(pgrep -f "claude -p.*session-summary" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${RUNNING:-0}" -ge "$SUMMARIZE_MAX_PROCS" ]; then
+            echo "Skipping summarization: $RUNNING summarizer(s) already running (max $SUMMARIZE_MAX_PROCS)." >&2
+            _enqueue_retry
+        else
+
+        # Guard: lock file to prevent duplicate work on the same session
+        mkdir -p "$LOCK_DIR" 2>/dev/null
+        LOCK_FILE="${LOCK_DIR}/summarize-$(basename "$CAP_PATH" .md).lock"
+        if [ -f "$LOCK_FILE" ]; then
+            LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+            if [ "$LOCK_AGE" -lt "$SUMMARIZE_TIMEOUT" ]; then
+                echo "Skipping summarization: lock file exists (age ${LOCK_AGE}s)." >&2
+            else
+                echo "Removing stale lock file (age ${LOCK_AGE}s)." >&2
+                rm -f "$LOCK_FILE"
+            fi
+        fi
+
+        if [ ! -f "$LOCK_FILE" ]; then
+            touch "$LOCK_FILE"
+
+            SUMMARIZE_PROMPT=$(cat << PROMPTEOF
 Read the raw Claude Code session file at ${CAP_PATH}.
 
 Then analyze it and produce a structured summary as a markdown file. Extract:
@@ -342,9 +399,31 @@ The body should have sections: What Happened, User Intent, Key Decisions, Action
 Create directories with mkdir -p if needed: ${SUMMARY_DIR}.
 PROMPTEOF
 )
-        nohup claude -p "$SUMMARIZE_PROMPT" > "${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log" 2>&1 &
-        echo "Summarization started in background (pid $!)."
+            LOG_FILE="${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log"
+            export CLAUDE_NO_CAPTURE=1
+            nohup bash -c "
+                timeout ${SUMMARIZE_TIMEOUT} claude -p \"\$1\" > \"\$2\" 2>&1
+                EXIT_CODE=\$?
+                rm -f \"\$3\"
+                if [ \$EXIT_CODE -ne 0 ]; then
+                    if [ \$EXIT_CODE -eq 124 ]; then
+                        echo 'Summarization timed out after ${SUMMARIZE_TIMEOUT}s' >> \"\$2\"
+                    fi
+                    # Enqueue for retry at next session start
+                    mkdir -p \"\$5\" 2>/dev/null
+                    grep -qF \"\$4\" \"\$5/pending-summaries.txt\" 2>/dev/null || echo \"\$4\" >> \"\$5/pending-summaries.txt\"
+                else
+                    # Success: remove from retry queue if present
+                    if [ -f \"\$5/pending-summaries.txt\" ]; then
+                        grep -vF \"\$4\" \"\$5/pending-summaries.txt\" > \"\$5/pending-summaries.tmp\" 2>/dev/null
+                        mv \"\$5/pending-summaries.tmp\" \"\$5/pending-summaries.txt\"
+                    fi
+                fi
+            " _ "$SUMMARIZE_PROMPT" "$LOG_FILE" "$LOCK_FILE" "$CAP_PATH" "$QUEUE_DIR" &
+            echo "Summarization started in background (pid $!, timeout ${SUMMARIZE_TIMEOUT}s)."
+        fi
 
+        fi  # end concurrency guard
         fi  # end summary freshness check
     fi
 else

@@ -14,7 +14,29 @@ PROJECTS_DIR="$HOME/.claude/projects"
 LOG_DIR="${VAULT}/_logs"
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+SUMMARIZE_TIMEOUT=300  # 5 minutes max per summarization
+QUEUE_DIR="${VAULT}/_queue"
+QUEUE_FILE="${QUEUE_DIR}/pending-summaries.txt"
+
 mkdir -p "$LOG_DIR" || { echo "Error: could not create log dir $LOG_DIR" >&2; exit 1; }
+
+# Kill any stale summarizer processes from previous runs (running > 10 min)
+while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    ELAPSED=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$ELAPSED" in
+        *-*|*:*:*) # days or hours — definitely stale
+            echo "Killing stale summarizer (pid $pid, elapsed $ELAPSED)"
+            kill "$pid" 2>/dev/null
+            ;;
+    esac
+done < <(pgrep -f "claude -p.*session-summary" 2>/dev/null; pgrep -f "claude -p.*summarize-session" 2>/dev/null)
+
+# Rotate old summarize logs (keep last 7 days)
+find "$LOG_DIR" -name "summarize-*.log" -mtime +7 -delete 2>/dev/null
+
+# Clean up stale lock files
+find "${VAULT}/_locks" -name "summarize-*.lock" -mtime +1 -delete 2>/dev/null
 
 echo "========================================="
 echo "Nightly capture started: $TIMESTAMP"
@@ -347,17 +369,32 @@ The body should have sections: What Happened, User Intent, Key Decisions, Action
 Create directories with mkdir -p if needed: ${SUMMARY_DIR}.
 SPEOF
 )
-            SUMMARIZE_OUTPUT=$(claude -p "$SUMMARIZE_PROMPT" 2>&1)
+            SUMMARIZE_OUTPUT=$(CLAUDE_NO_CAPTURE=1 timeout "$SUMMARIZE_TIMEOUT" claude -p "$SUMMARIZE_PROMPT" 2>&1)
             CLAUDE_EXIT=$?
 
             if [ $CLAUDE_EXIT -eq 0 ]; then
                 SUMMARIZED_COUNT=$((SUMMARIZED_COUNT + 1))
                 echo "  Summarized successfully"
+                # Remove from retry queue on success
+                if [ -f "$QUEUE_FILE" ]; then
+                    grep -vF "$CAP_PATH" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" 2>/dev/null
+                    mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
+                fi
+            elif [ $CLAUDE_EXIT -eq 124 ]; then
+                echo "  Summarization timed out after ${SUMMARIZE_TIMEOUT}s"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                mkdir -p "$QUEUE_DIR" 2>/dev/null
+                grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
             else
                 echo "  Summarization failed (exit $CLAUDE_EXIT): $(echo "$SUMMARIZE_OUTPUT" | head -3)"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                mkdir -p "$QUEUE_DIR" 2>/dev/null
+                grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
             fi
         else
-            echo "  Skipping summarization: claude CLI not found. Run /summarize-session manually."
+            echo "  Skipping summarization: claude CLI not found."
+            mkdir -p "$QUEUE_DIR" 2>/dev/null
+            grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
         fi
 
     done < <(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -mtime -2 2>/dev/null)
