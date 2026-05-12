@@ -1,114 +1,122 @@
 #!/bin/bash
-# SessionEnd hook: auto-capture the current session's raw conversation data
-# to the Obsidian vault when a Claude Code session closes.
+# Nightly cron script: capture and summarize active Claude Code sessions.
+# Scans all project directories for JSONL files modified in the last 24 hours,
+# captures any that are new or have new content, then summarizes via claude -p.
 #
 # Install:
-#   cp hooks/auto-capture-session.sh ~/.claude/hooks/
-#   chmod +x ~/.claude/hooks/auto-capture-session.sh
-#   Add to ~/.claude/settings.json:
-#   {
-#     "hooks": {
-#       "SessionEnd": [{
-#         "matcher": "",
-#         "hooks": [{
-#           "type": "command",
-#           "command": "bash ~/.claude/hooks/auto-capture-session.sh"
-#         }]
-#       }]
-#     }
-#   }
-
-[ "$CLAUDE_NO_CAPTURE" = "1" ] && exit 0
+#   cp hooks/nightly-capture-and-summarize.sh ~/.claude/hooks/
+#   chmod +x ~/.claude/hooks/nightly-capture-and-summarize.sh
+#   crontab -e  # add the following line:
+#   0 3 * * * bash ~/.claude/hooks/nightly-capture-and-summarize.sh >> ~/ObsidianVaults/ClaudeCode/_logs/nightly-cron.log 2>&1
 
 VAULT="${CLAUDE_VAULT_PATH:-$HOME/ObsidianVaults/ClaudeCode}"
+PROJECTS_DIR="$HOME/.claude/projects"
+LOG_DIR="${VAULT}/_logs"
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# Kill any summarizer processes running longer than 10 minutes (likely zombies)
+SUMMARIZE_TIMEOUT=300  # 5 minutes max per summarization
+QUEUE_DIR="${VAULT}/_queue"
+QUEUE_FILE="${QUEUE_DIR}/pending-summaries.txt"
+
+mkdir -p "$LOG_DIR" || { echo "Error: could not create log dir $LOG_DIR" >&2; exit 1; }
+
+# Kill any stale summarizer processes from previous runs (running > 10 min)
 while IFS= read -r pid; do
     [ -z "$pid" ] && continue
     ELAPSED=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
     case "$ELAPSED" in
         *-*|*:*:*) # days or hours — definitely stale
-            echo "Killing stale summarizer (pid $pid, elapsed $ELAPSED)" >&2
+            echo "Killing stale summarizer (pid $pid, elapsed $ELAPSED)"
             kill "$pid" 2>/dev/null
             ;;
     esac
 done < <(pgrep -f "claude -p.*session-summary" 2>/dev/null; pgrep -f "claude -p.*summarize-session" 2>/dev/null)
 
-# Rotate old summarize logs (keep last 30)
-if [ -d "${VAULT}/_logs" ]; then
-    find "${VAULT}/_logs" -name "summarize-*.log" -mtime +7 -delete 2>/dev/null
-fi
+# Rotate old summarize logs (keep last 7 days)
+find "$LOG_DIR" -name "summarize-*.log" -mtime +7 -delete 2>/dev/null
+
+# Clean up stale lock files
+find "${VAULT}/_locks" -name "summarize-*.lock" -mtime +1 -delete 2>/dev/null
+
+echo "========================================="
+echo "Nightly capture started: $TIMESTAMP"
+echo "========================================="
 
 if ! command -v python3 &>/dev/null; then
-    echo "Auto-capture skipped: python3 not found." >&2
+    echo "Error: python3 not found." >&2
+    exit 1
+fi
+
+if [ ! -d "$PROJECTS_DIR" ]; then
+    echo "No projects directory found at $PROJECTS_DIR"
     exit 0
 fi
 
-INPUT=$(cat)
+CAPTURED_COUNT=0
+SUMMARIZED_COUNT=0
+SKIPPED_COUNT=0
+FAILED_COUNT=0
 
-# Parse session_id and cwd in a single Python call to avoid double-parsing
-eval "$(echo "$INPUT" | python3 -c "
-import json, sys, shlex
-d = json.load(sys.stdin)
-sid = d.get('session_id', '')
-cwd = d.get('cwd', '')
-print(f'SESSION_ID={shlex.quote(sid)}')
-print(f'CWD={shlex.quote(cwd)}')
-" 2>/dev/null)"
+for proj_dir in "$PROJECTS_DIR"/*/; do
+    [ ! -d "$proj_dir" ] && continue
 
-if [ -z "$SESSION_ID" ]; then
-    echo "Auto-capture: session_id not present in hook input, skipping." >&2
-    exit 0
-fi
-if [ -z "$CWD" ]; then
-    echo "Auto-capture: no cwd in hook input, skipping." >&2
-    exit 0
-fi
+    proj_encoded=$(basename "$proj_dir")
 
-ENCODED=$(echo "$CWD" | sed 's|/|-|g')
-PROJ_DIR="$HOME/.claude/projects/${ENCODED}"
+    while IFS= read -r jsonl_file; do
+        [ -z "$jsonl_file" ] && continue
 
-if [ ! -d "$PROJ_DIR" ]; then
-    echo "Auto-capture: project directory not found: $PROJ_DIR" >&2
-    exit 0
-fi
+        session_id=$(basename "$jsonl_file" .jsonl)
+        short_id="${session_id:0:8}"
 
-JSONL_PATH="${PROJ_DIR}/${SESSION_ID}.jsonl"
-[ ! -f "$JSONL_PATH" ] && exit 0
+        # Skip files held open by a running Claude process (active sessions)
+        if lsof "$jsonl_file" 2>/dev/null | grep -qi "claude"; then
+            echo "  Skipping active session: $short_id"
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
 
-# Skip programmatic sessions (sdk-cli = background claude -p, hooks, SDK calls)
-export _PROBE_PATH="$JSONL_PATH"
-ENTRYPOINT=$(python3 -c "
+        # Decode project name from the first record's cwd
+        export _PROBE_JSONL="$jsonl_file"
+        project_name=$(python3 -c "
 import json, os
-with open(os.environ['_PROBE_PATH']) as f:
+fpath = os.environ['_PROBE_JSONL']
+with open(fpath) as f:
     for line in f:
         line = line.strip()
         if not line: continue
         try:
             r = json.loads(line)
-            if r.get('entrypoint'):
-                print(r['entrypoint'])
+            if r.get('cwd'):
+                print(os.path.basename(r['cwd']))
                 break
         except json.JSONDecodeError: pass
 " 2>/dev/null)
-unset _PROBE_PATH
+        unset _PROBE_JSONL
 
-if [ "$ENTRYPOINT" != "cli" ]; then
-    exit 0
-fi
+        [ -z "$project_name" ] && project_name="unknown"
 
-SHORT_ID="${SESSION_ID:0:8}"
-PROJECT_NAME=$(basename "$CWD")
+        raw_dir="${VAULT}/sessions/raw/${project_name}"
+        existing=$(find "$raw_dir" -name "*-${short_id}.md" 2>/dev/null | head -1)
 
-EXISTING=$(find "${VAULT}/sessions/raw/${PROJECT_NAME}" -name "*-${SHORT_ID}.md" 2>/dev/null | head -1)
-if [ -n "$EXISTING" ] && [ ! "$JSONL_PATH" -nt "$EXISTING" ]; then
-    exit 0
-fi
+        needs_capture=false
+        if [ -z "$existing" ]; then
+            needs_capture=true
+        elif [ "$jsonl_file" -nt "$existing" ]; then
+            needs_capture=true
+        fi
 
-export _CAPTURE_JSONL_PATH="$JSONL_PATH"
-export _CAPTURE_VAULT="$VAULT"
+        if [ "$needs_capture" = false ]; then
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
 
-RESULT=$(python3 << 'PYEOF'
+        echo ""
+        echo "Capturing: $project_name ($short_id...)"
+
+        export _CAPTURE_JSONL_PATH="$jsonl_file"
+        export _CAPTURE_VAULT="$VAULT"
+
+        CAPTURE_RESULT=$(python3 << 'PYEOF'
 import json, os, sys
 from collections import Counter
 from datetime import datetime
@@ -136,7 +144,7 @@ if skipped > 0:
     sys.stderr.write(f"Warning: {skipped} malformed lines skipped in {fpath}\n")
 
 if not records:
-    sys.stderr.write(f"Error: no valid records found in {fpath} ({skipped} lines were malformed)\n")
+    sys.stderr.write(f"No valid records in {fpath}\n")
     sys.exit(1)
 
 session_id = ""
@@ -182,15 +190,17 @@ if timestamps:
         start_time, end_time = timestamps[0], timestamps[-1]
 else:
     start_time, end_time = "", ""
+
 date = start_time[:10] if start_time else datetime.now().strftime("%Y-%m-%d")
 title = custom_title or agent_name or "Untitled"
 
 duration_minutes = 0
 if start_time and end_time:
     try:
-        t1 = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        t2 = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        duration_minutes = int((t2 - t1).total_seconds() / 60)
+        t1 = parse_ts(start_time)
+        t2 = parse_ts(end_time)
+        if t1 and t2:
+            duration_minutes = int((t2 - t1).total_seconds() / 60)
     except (ValueError, TypeError) as e:
         sys.stderr.write(f"Warning: could not parse timestamps for duration: {e}\n")
         duration_minutes = 0
@@ -305,7 +315,7 @@ try:
     with open(out_path, "w") as f:
         f.write(output)
 except OSError as e:
-    sys.stderr.write(f"Error: could not write session capture to {out_dir}: {e}\n")
+    sys.stderr.write(f"Error writing to {out_dir}: {e}\n")
     sys.exit(2)
 
 print(json.dumps({
@@ -313,73 +323,33 @@ print(json.dumps({
     "project": project_name,
     "branch": primary_branch,
     "date": date,
-    "duration": duration_minutes,
-    "turns": turn_num
+    "turns": turn_num,
+    "session_id": session_id
 }))
 PYEOF
 )
-PYTHON_EXIT=$?
 
-unset _CAPTURE_JSONL_PATH _CAPTURE_VAULT
+        PYTHON_EXIT=$?
+        unset _CAPTURE_JSONL_PATH _CAPTURE_VAULT
 
-if [ $PYTHON_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
-    CAP_PATH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path',''))" 2>/dev/null)
-    CAP_PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))" 2>/dev/null)
-    CAP_BRANCH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('branch',''))" 2>/dev/null)
-    CAP_DATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('date',''))" 2>/dev/null)
-    CAP_TURNS=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('turns',0))" 2>/dev/null)
-    echo "Session captured on exit: ${CAP_PROJECT}/${CAP_BRANCH} (${CAP_DATE}, ${CAP_TURNS} turns)."
-
-    # Summarize in background via headless claude (skip short sessions)
-    MIN_TURNS=2
-    SUMMARIZE_TIMEOUT=300  # 5 minutes max
-    SUMMARIZE_MAX_PROCS=2  # max concurrent summarizers
-    LOCK_DIR="${VAULT}/_locks"
-    QUEUE_DIR="${VAULT}/_queue"
-    QUEUE_FILE="${QUEUE_DIR}/pending-summaries.txt"
-
-    if command -v claude &>/dev/null && [ -n "$CAP_PATH" ] && [ "${CAP_TURNS:-0}" -ge "$MIN_TURNS" ]; then
-        SUMMARY_DIR="${VAULT}/sessions/summaries/${CAP_PROJECT}"
-        SUMMARY_FILE="${SUMMARY_DIR}/$(basename "$CAP_PATH")"
-
-        # Skip if summary already exists and is newer than the capture
-        if [ -f "$SUMMARY_FILE" ] && [ ! "$CAP_PATH" -nt "$SUMMARY_FILE" ]; then
-            echo "Summary already up to date, skipping."
-        else
-
-        # Helper: enqueue a session for retry at next SessionStart
-        _enqueue_retry() {
-            mkdir -p "$QUEUE_DIR" 2>/dev/null
-            # Avoid duplicates
-            if ! grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null; then
-                echo "$CAP_PATH" >> "$QUEUE_FILE"
-            fi
-        }
-
-        # Guard: don't spawn if too many summarizers are already running
-        RUNNING=$(pgrep -f "claude -p.*session-summary" 2>/dev/null | wc -l | tr -d ' ')
-        if [ "${RUNNING:-0}" -ge "$SUMMARIZE_MAX_PROCS" ]; then
-            echo "Skipping summarization: $RUNNING summarizer(s) already running (max $SUMMARIZE_MAX_PROCS)." >&2
-            _enqueue_retry
-        else
-
-        # Guard: lock file to prevent duplicate work on the same session
-        mkdir -p "$LOCK_DIR" 2>/dev/null
-        LOCK_FILE="${LOCK_DIR}/summarize-$(basename "$CAP_PATH" .md).lock"
-        if [ -f "$LOCK_FILE" ]; then
-            LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
-            if [ "$LOCK_AGE" -lt "$SUMMARIZE_TIMEOUT" ]; then
-                echo "Skipping summarization: lock file exists (age ${LOCK_AGE}s)." >&2
-            else
-                echo "Removing stale lock file (age ${LOCK_AGE}s)." >&2
-                rm -f "$LOCK_FILE"
-            fi
+        if [ $PYTHON_EXIT -ne 0 ] || [ -z "$CAPTURE_RESULT" ]; then
+            echo "  FAILED: capture error for $short_id ($jsonl_file)"
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+            continue
         fi
 
-        if [ ! -f "$LOCK_FILE" ]; then
-            touch "$LOCK_FILE"
+        CAPTURED_COUNT=$((CAPTURED_COUNT + 1))
+        CAP_PROJECT=$(echo "$CAPTURE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('project',''))" 2>/dev/null)
+        CAP_PATH=$(echo "$CAPTURE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('path',''))" 2>/dev/null)
+        echo "  Captured: $CAP_PATH"
 
-            SUMMARIZE_PROMPT=$(cat << PROMPTEOF
+        # Summarize via headless claude (explicit prompt, no skill dependency)
+        if command -v claude &>/dev/null; then
+            echo "  Summarizing via claude -p..."
+            SUMMARY_DIR="${VAULT}/sessions/summaries/${CAP_PROJECT}"
+            SUMMARY_FILE="${SUMMARY_DIR}/$(basename "$CAP_PATH")"
+
+            SUMMARIZE_PROMPT=$(cat << SPEOF
 Read the raw Claude Code session file at ${CAP_PATH}.
 
 Then analyze it and produce a structured summary as a markdown file. Extract:
@@ -392,40 +362,49 @@ Then analyze it and produce a structured summary as a markdown file. Extract:
 - Status (completed/in-progress/blocked)
 - User intent
 
-Write the summary to ${SUMMARY_FILE} with this YAML frontmatter: date, project, session_id, branch, type: session-summary, tags, status, last_summarized_at (current ISO timestamp), summarized_through (latest turn timestamp), decisions, action_items, open_questions, files_touched, raw_session (wikilink to raw file).
+Write the summary to ${SUMMARY_FILE} with YAML frontmatter: date, project, session_id, branch, type: session-summary, tags, status, last_summarized_at (current ISO timestamp), summarized_through (latest turn timestamp), decisions, action_items, open_questions, files_touched, raw_session (wikilink to raw file).
 
 The body should have sections: What Happened, User Intent, Key Decisions, Action Items (checkboxes), Open Questions, Files Touched, Topics.
 
 Create directories with mkdir -p if needed: ${SUMMARY_DIR}.
-PROMPTEOF
+SPEOF
 )
-            LOG_FILE="${VAULT}/_logs/summarize-$(date +%Y%m%d-%H%M%S).log"
-            export CLAUDE_NO_CAPTURE=1
-            nohup bash -c "
-                timeout ${SUMMARIZE_TIMEOUT} claude -p \"\$1\" > \"\$2\" 2>&1
-                EXIT_CODE=\$?
-                rm -f \"\$3\"
-                if [ \$EXIT_CODE -ne 0 ]; then
-                    if [ \$EXIT_CODE -eq 124 ]; then
-                        echo 'Summarization timed out after ${SUMMARIZE_TIMEOUT}s' >> \"\$2\"
-                    fi
-                    # Enqueue for retry at next session start
-                    mkdir -p \"\$5\" 2>/dev/null
-                    grep -qF \"\$4\" \"\$5/pending-summaries.txt\" 2>/dev/null || echo \"\$4\" >> \"\$5/pending-summaries.txt\"
-                else
-                    # Success: remove from retry queue if present
-                    if [ -f \"\$5/pending-summaries.txt\" ]; then
-                        grep -vF \"\$4\" \"\$5/pending-summaries.txt\" > \"\$5/pending-summaries.tmp\" 2>/dev/null
-                        mv \"\$5/pending-summaries.tmp\" \"\$5/pending-summaries.txt\"
-                    fi
+            SUMMARIZE_OUTPUT=$(CLAUDE_NO_CAPTURE=1 timeout "$SUMMARIZE_TIMEOUT" claude -p "$SUMMARIZE_PROMPT" 2>&1)
+            CLAUDE_EXIT=$?
+
+            if [ $CLAUDE_EXIT -eq 0 ]; then
+                SUMMARIZED_COUNT=$((SUMMARIZED_COUNT + 1))
+                echo "  Summarized successfully"
+                # Remove from retry queue on success
+                if [ -f "$QUEUE_FILE" ]; then
+                    grep -vF "$CAP_PATH" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" 2>/dev/null
+                    mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
                 fi
-            " _ "$SUMMARIZE_PROMPT" "$LOG_FILE" "$LOCK_FILE" "$CAP_PATH" "$QUEUE_DIR" &
-            echo "Summarization started in background (pid $!, timeout ${SUMMARIZE_TIMEOUT}s)."
+            elif [ $CLAUDE_EXIT -eq 124 ]; then
+                echo "  Summarization timed out after ${SUMMARIZE_TIMEOUT}s"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                mkdir -p "$QUEUE_DIR" 2>/dev/null
+                grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
+            else
+                echo "  Summarization failed (exit $CLAUDE_EXIT): $(echo "$SUMMARIZE_OUTPUT" | head -3)"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                mkdir -p "$QUEUE_DIR" 2>/dev/null
+                grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
+            fi
+        else
+            echo "  Skipping summarization: claude CLI not found."
+            mkdir -p "$QUEUE_DIR" 2>/dev/null
+            grep -qF "$CAP_PATH" "$QUEUE_FILE" 2>/dev/null || echo "$CAP_PATH" >> "$QUEUE_FILE"
         fi
 
-        fi  # end concurrency guard
-        fi  # end summary freshness check
-    fi
-else
-    echo "Auto-capture failed for current session. Run /capture-session manually to retry." >&2
-fi
+    done < <(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -mtime -2 2>/dev/null)
+done
+
+echo ""
+echo "========================================="
+echo "Nightly capture complete: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "  Captured:   $CAPTURED_COUNT"
+echo "  Summarized: $SUMMARIZED_COUNT"
+echo "  Skipped:    $SKIPPED_COUNT (already up to date)"
+echo "  Failed:     $FAILED_COUNT"
+echo "========================================="

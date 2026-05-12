@@ -32,16 +32,20 @@ cp UsefulSkills/agents/*.md ~/.claude/agents/
 mkdir -p ~/.claude/hooks
 cp UsefulSkills/hooks/auto-capture-session.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/auto-capture-session.sh
+
+# 5. (Optional) Install the nightly cron script
+cp UsefulSkills/hooks/nightly-capture-and-summarize.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/nightly-capture-and-summarize.sh
 ```
 
 ### Hook Configuration
 
-To auto-capture the previous session whenever you start a new Claude Code session, add this to `~/.claude/settings.json`:
+To auto-capture the current session whenever you close Claude Code, add this to `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "SessionStart": [
+    "SessionEnd": [
       {
         "matcher": "",
         "hooks": [
@@ -55,6 +59,27 @@ To auto-capture the previous session whenever you start a new Claude Code sessio
   }
 }
 ```
+
+### Nightly Cron Setup (Optional)
+
+For long-running sessions that stay open overnight, set up a nightly cron job that captures and summarizes active sessions at 3 AM:
+
+```bash
+crontab -e
+# Add this line:
+0 3 * * * bash ~/.claude/hooks/nightly-capture-and-summarize.sh >> ~/ObsidianVaults/ClaudeCode/_logs/nightly-cron.log 2>&1
+```
+
+The nightly job scans all projects for sessions modified in the last 24 hours, captures any new or updated sessions, and runs `claude -p` headlessly to generate summaries. Logs are saved to `~/ObsidianVaults/ClaudeCode/_logs/`.
+
+### Cross-Project Portability
+
+All skills, agents, and hooks are installed at the user level (`~/.claude/`), so they work across **all** Claude Code sessions regardless of which project you're in:
+
+- Skills in `~/.claude/skills/` are available in every session
+- Agents in `~/.claude/agents/` are available in every session
+- Hooks in `~/.claude/settings.json` fire for every session
+- The vault path (`~/ObsidianVaults/ClaudeCode/`) organizes data by project name automatically
 
 ### Obsidian Vault Setup
 
@@ -105,7 +130,7 @@ A pipeline for capturing, organizing, and navigating Claude Code conversation hi
 5. /suggest-actions     → suggests next steps for a thread
 ```
 
-With the auto-capture hook installed, step 1 happens automatically on every session start.
+With the auto-capture hook installed, step 1 happens automatically when you close a session. With the nightly cron, both steps 1 and 2 happen automatically for long-running sessions.
 
 ### `/capture-session`
 
@@ -120,11 +145,12 @@ Captures raw conversation data from a Claude Code session JSONL file and writes 
 
 ### `/summarize-session`
 
-Generates a structured summary from a captured session using the thread-tracker agent. Extracts decisions, action items, open questions, and topic tags. Automatically updates the thread file for the session's branch.
+Generates a structured summary from a captured session using the thread-tracker agent. Supports **incremental updates** — if a summary already exists, only new conversation turns since the last summarization are analyzed and merged. Tracks summarization coverage with timestamps.
 
 ```
-/summarize-session                     # summarize most recent capture
+/summarize-session                     # summarize (or incrementally update) most recent capture
 /summarize-session --previous          # summarize the previous capture
+/summarize-session --fresh             # force full re-summarization from scratch
 /summarize-session <session-id>        # summarize a specific session
 ```
 
